@@ -12,8 +12,8 @@
 //
 // ------------------------------------------------------------------------
 
-#ifndef dealii_mg_portable_global_coarsening_templates_h
-#define dealii_mg_portable_global_coarsening_templates_h
+#ifndef dealii_portable_mg_global_coarsening_templates_h
+#define dealii_portable_mg_global_coarsening_templates_h
 
 #include <deal.II/base/config.h>
 
@@ -27,6 +27,8 @@
 #include <deal.II/fe/fe_tools.h>
 #include <deal.II/fe/fe_values.h>
 
+#include <deal.II/matrix_free/portable_tensor_product_kernels.h>
+
 #include <deal.II/multigrid/mg_transfer_matrix_free.h>
 #include <deal.II/multigrid/mg_transfer_matrix_free.templates.h>
 #include <deal.II/multigrid/portable_mg_transfer_global_coarsening.h>
@@ -37,6 +39,317 @@ namespace Portable
 {
   namespace internal
   {
+
+
+    /**
+     * Helper class to select the right templated implementation.
+     *
+     * @note This class is similar to internal::FEEvaluationFactory
+     */
+    class CellTransferFactory
+    {
+    public:
+      static const unsigned int max_degree = 9;
+
+      CellTransferFactory(const unsigned int degree_fine,
+                          const unsigned int degree_coarse)
+        : degree_fine(degree_fine)
+        , degree_coarse(degree_coarse)
+      {}
+
+      template <typename Fu, unsigned int deg = 1>
+      bool
+      run(Fu &fu) const
+      {
+        if ((degree_fine == (2 * deg)) && (degree_coarse == deg))
+          fu.template run<2 * deg, deg>(); // h-MG (FE_Q)
+        else if ((degree_fine == (2 * deg + 1)) && (degree_coarse == deg))
+          fu.template run<2 * deg + 1, deg>(); // h-MG
+        // else if ((degree_fine == deg) && (degree_coarse == deg))
+        //   fu.template run<deg, deg>(); // identity (nothing to do)
+        else if (deg < max_degree)
+          return run<Fu, std::min(deg + 1, max_degree)>(fu); // try next degree
+        else
+          {
+            // no match -> slow path
+            // fu.template run<-1, -1>(degree_fine, degree_coarse);
+            return false; // indicate that slow path has been taken
+          }
+
+        return true; // indicate that fast path has been taken
+      }
+
+    private:
+      const unsigned int degree_fine;
+      const unsigned int degree_coarse;
+    };
+
+    template <int dim, typename VectorType>
+    class CellProlongator
+    {
+    public:
+      using Number = typename VectorType::value_type;
+
+      using TeamHandle = Kokkos::TeamPolicy<
+        MemorySpace::Default::kokkos_space::execution_space>::member_type;
+
+      using SharedViewValues =
+        Kokkos::View<Number *,
+                     MemorySpace::Default::kokkos_space::execution_space::
+                       scratch_memory_space,
+                     Kokkos::MemoryTraits<Kokkos::Unmanaged>>;
+
+      CellProlongator(
+        const typename MGTwoLevelTransfer<dim, VectorType>::TransferCellData
+                                  *cell_data,
+        const DeviceVector<Number> src,
+        const DeviceVector<Number> dst)
+        : cell_data(cell_data)
+        , src(src)
+        , dst(dst)
+      {}
+
+      template <int degree_fine, int degree_coarse>
+      DEAL_II_HOST_DEVICE void
+      run() const
+      {
+        const int   coarse_cell_index = cell_data->coarse_cell_index;
+        const auto &team_member       = cell_data->team_member;
+
+        const auto &prolongation_matrix_scratch =
+          cell_data->prolongation_matrix_device;
+
+        const auto &transfer_data = cell_data->transfer_data;
+
+        const auto &dof_indices_coarse = transfer_data.dof_indices_coarse;
+        const auto &dof_indices_fine   = transfer_data.dof_indices_fine;
+
+        auto &values_coarse = cell_data->values_coarse;
+        auto &values_fine   = cell_data->values_fine;
+        auto &scratch_pad   = cell_data->scratch_pad;
+
+        // read coarse dof values
+        Kokkos::parallel_for(
+          Kokkos::TeamThreadRange(team_member,
+                                  transfer_data.n_dofs_per_cell_coarse),
+          [&](const int &i) {
+            const unsigned int dof_index =
+              dof_indices_coarse(i, coarse_cell_index);
+            if (dof_index != numbers::invalid_unsigned_int)
+              values_coarse(i) = src[dof_index];
+            else
+              values_coarse(i) = 0.;
+          });
+
+        team_member.team_barrier();
+
+        // the evaluator does not need temporary storage since no in-place
+        // operation takes place in this function
+        auto scratch_for_eval =
+          Kokkos::subview(scratch_pad, Kokkos::make_pair(0, 0));
+
+        internal::EvaluatorTensorProduct<
+          EvaluatorVariant::evaluate_general,
+          dim,
+          degree_coarse + 1,
+          degree_fine + 1,
+          Number,
+          MemorySpace::Default::kokkos_space::execution_space::
+            scratch_memory_space>
+          eval(team_member,
+               prolongation_matrix_scratch,
+               SharedViewValues(),
+               SharedViewValues(),
+               scratch_for_eval);
+
+        // apply kernel in each direction
+        if constexpr (dim == 2)
+          {
+            const int temp_size = (degree_coarse + 1) * (degree_fine + 1);
+            auto      temp =
+              Kokkos::subview(scratch_pad, Kokkos::make_pair(0, temp_size));
+
+            eval.template values<0, true, false, false>(values_coarse, temp);
+            eval.template values<1, true, false, false>(temp, values_fine);
+          }
+        else if constexpr (dim == 3)
+          {
+            const int temp1_size =
+              Utilities::pow(degree_coarse + 1, 2) * (degree_fine + 1);
+            const int temp2_size =
+              Utilities::pow(degree_fine + 1, 2) * (degree_coarse + 1);
+            auto temp1 =
+              Kokkos::subview(scratch_pad, Kokkos::make_pair(0, temp1_size));
+            auto temp2 =
+              Kokkos::subview(scratch_pad,
+                              Kokkos::make_pair(temp1_size,
+                                                temp1_size + temp2_size));
+
+            eval.template values<0, true, false, false>(values_coarse, temp1);
+            eval.template values<1, true, false, false>(temp1, temp2);
+            eval.template values<2, true, false, false>(temp2, values_fine);
+          }
+
+        team_member.team_barrier();
+
+        // apply weights
+        Kokkos::parallel_for(Kokkos::TeamThreadRange(
+                               team_member, transfer_data.n_dofs_per_cell_fine),
+                             [&](const int &i) {
+                               values_fine(i) *=
+                                 transfer_data.weights(i, coarse_cell_index);
+                             });
+        team_member.team_barrier();
+
+        Kokkos::parallel_for(Kokkos::TeamThreadRange(
+                               team_member, transfer_data.n_dofs_per_cell_fine),
+                             [&](const int &i) {
+                               const unsigned int dof_index =
+                                 dof_indices_fine(i, coarse_cell_index);
+                               Kokkos::atomic_add(&dst[dof_index],
+                                                  values_fine(i));
+                             });
+        team_member.team_barrier();
+      }
+
+    private:
+      const typename MGTwoLevelTransfer<dim, VectorType>::TransferCellData
+                                *cell_data;
+      const DeviceVector<Number> src;
+      const DeviceVector<Number> dst;
+    };
+
+
+    template <int dim, typename VectorType>
+    class CellRestrictor
+    {
+    public:
+      using Number = typename VectorType::value_type;
+
+      using TeamHandle = Kokkos::TeamPolicy<
+        MemorySpace::Default::kokkos_space::execution_space>::member_type;
+
+      using SharedViewValues =
+        Kokkos::View<Number *,
+                     MemorySpace::Default::kokkos_space::execution_space::
+                       scratch_memory_space,
+                     Kokkos::MemoryTraits<Kokkos::Unmanaged>>;
+
+      CellRestrictor(
+        const typename MGTwoLevelTransfer<dim, VectorType>::TransferCellData
+                                  *cell_data,
+        const DeviceVector<Number> src,
+        const DeviceVector<Number> dst)
+        : cell_data(cell_data)
+        , src(src)
+        , dst(dst)
+      {}
+
+      template <int degree_fine, int degree_coarse>
+      DEAL_II_HOST_DEVICE void
+      run() const
+      {
+        const int   coarse_cell_index = cell_data->coarse_cell_index;
+        const auto &team_member       = cell_data->team_member;
+
+        const auto &prolongation_matrix_scratch =
+          cell_data->prolongation_matrix_device;
+
+        const auto &transfer_data = cell_data->transfer_data;
+
+        const auto &dof_indices_coarse = transfer_data.dof_indices_coarse;
+        const auto &dof_indices_fine   = transfer_data.dof_indices_fine;
+
+        auto &values_coarse = cell_data->values_coarse;
+        auto &values_fine   = cell_data->values_fine;
+        auto &scratch_pad   = cell_data->scratch_pad;
+
+        // read fine dof values
+        Kokkos::parallel_for(Kokkos::TeamThreadRange(
+                               team_member, transfer_data.n_dofs_per_cell_fine),
+                             [&](const int &i) {
+                               values_fine(i) =
+                                 src[dof_indices_fine(i, coarse_cell_index)];
+                             });
+        team_member.team_barrier();
+
+        // apply weights
+        Kokkos::parallel_for(Kokkos::TeamThreadRange(
+                               team_member, transfer_data.n_dofs_per_cell_fine),
+                             [&](const int &i) {
+                               values_fine(i) *=
+                                 transfer_data.weights(i, coarse_cell_index);
+                             });
+        team_member.team_barrier();
+
+        // the evaluator does not need temporary storage since no in-place
+        // operation takes place in this function
+        auto scratch_for_eval =
+          Kokkos::subview(scratch_pad, Kokkos::make_pair(0, 0));
+
+        internal::EvaluatorTensorProduct<
+          EvaluatorVariant::evaluate_general,
+          dim,
+          degree_coarse + 1,
+          degree_fine + 1,
+          Number,
+          MemorySpace::Default::kokkos_space::execution_space::
+            scratch_memory_space>
+          eval(team_member,
+               prolongation_matrix_scratch,
+               SharedViewValues(),
+               SharedViewValues(),
+               scratch_for_eval);
+
+        // apply kernel in each direction
+        if constexpr (dim == 2)
+          {
+            const int temp_size = (degree_coarse + 1) * (degree_fine + 1);
+            auto      temp =
+              Kokkos::subview(scratch_pad, Kokkos::make_pair(0, temp_size));
+
+            eval.template values<1, false, false, false>(values_fine, temp);
+            eval.template values<0, false, false, false>(temp, values_coarse);
+          }
+        else if constexpr (dim == 3)
+          {
+            const int temp1_size =
+              Utilities::pow(degree_fine + 1, 2) * (degree_coarse + 1);
+            const int temp2_size =
+              Utilities::pow(degree_coarse + 1, 2) * (degree_fine + 1);
+            auto temp1 =
+              Kokkos::subview(scratch_pad, Kokkos::make_pair(0, temp1_size));
+            auto temp2 =
+              Kokkos::subview(scratch_pad,
+                              Kokkos::make_pair(temp1_size,
+                                                temp1_size + temp2_size));
+
+            eval.template values<2, false, false, false>(values_fine, temp1);
+            eval.template values<1, false, false, false>(temp1, temp2);
+            eval.template values<0, false, false, false>(temp2, values_coarse);
+          }
+
+        team_member.team_barrier();
+
+        // distribute coarse dofs values
+        Kokkos::parallel_for(
+          Kokkos::TeamThreadRange(team_member,
+                                  transfer_data.n_dofs_per_cell_coarse),
+          [&](const int &i) {
+            const unsigned int dof_index =
+              dof_indices_coarse(i, coarse_cell_index);
+            if (dof_index != numbers::invalid_unsigned_int)
+              Kokkos::atomic_add(&dst[dof_index], values_coarse(i));
+          });
+        team_member.team_barrier();
+      }
+
+    private:
+      const typename MGTwoLevelTransfer<dim, VectorType>::TransferCellData
+                                *cell_data;
+      const DeviceVector<Number> src;
+      const DeviceVector<Number> dst;
+    };
 
     template <int dim, typename VectorType, typename Functor>
     struct ApplyCellKernel
@@ -999,9 +1312,18 @@ namespace Portable
     using TeamPolicy =
       Kokkos::TeamPolicy<MemorySpace::Default::kokkos_space::execution_space>;
 
-    using Functor = internal::CellProlongationKernel<dim, VectorType>;
+    using TeamHandle = Kokkos::TeamPolicy<
+      MemorySpace::Default::kokkos_space::execution_space>::member_type;
+
+    using SharedViewValues = Kokkos::View<
+      Number *,
+      MemorySpace::Default::kokkos_space::execution_space::scratch_memory_space,
+      Kokkos::MemoryTraits<Kokkos::Unmanaged>>;
 
     MemorySpace::Default::kokkos_space::execution_space exec;
+
+    DeviceVector<Number> dst_device(dst.get_values(), dst.locally_owned_size());
+    DeviceVector<Number> src_device(src.get_values(), src.locally_owned_size());
 
     unsigned int scheme_index = 0;
     for (auto &scheme : schemes)
@@ -1009,18 +1331,107 @@ namespace Portable
         if (scheme.n_coarse_cells == 0)
           continue;
 
-        Functor prolongator;
-
         auto team_policy =
           TeamPolicy(exec, scheme.n_coarse_cells, Kokkos::AUTO);
 
-        internal::ApplyCellKernel<dim, VectorType, Functor> apply_prolongation(
-          prolongator, scheme, src, dst);
 
-        Kokkos::parallel_for("prolongate_and_add_h_transfer_scheme_" +
-                               std::to_string(scheme_index),
-                             team_policy,
-                             apply_prolongation);
+        internal::CellTransferFactory cell_transfer(scheme.degree_fine,
+                                                    scheme.degree_coarse);
+
+        const auto team_shmem_size = SharedViewValues::shmem_size(
+          scheme.n_dofs_per_cell_coarse + // coarse dof values
+          scheme.n_dofs_per_cell_fine +   // fine dof values
+          2 * scheme.n_dofs_per_cell_fine // at most two tmp vectors of at
+                                          // most n_dofs_per_cell_fine size
+          + (scheme.degree_coarse + 1) *
+              (scheme.degree_fine + 1) // prolongation matrix
+        );
+
+        team_policy.set_scratch_size(0, Kokkos::PerTeam(team_shmem_size));
+
+        Kokkos::parallel_for(
+          "prolongate_and_add_h_transfer_scheme_" +
+            std::to_string(scheme_index),
+          team_policy,
+          KOKKOS_LAMBDA(const TeamHandle &team_member) {
+            const int coarse_cell_index = team_member.league_rank();
+
+            SharedViewValues values_coarse(team_member.team_shmem(),
+                                           scheme.n_dofs_per_cell_coarse);
+
+            SharedViewValues values_fine(team_member.team_shmem(),
+                                         scheme.n_dofs_per_cell_fine);
+
+            SharedViewValues prolongation_matrix_device(
+              team_member.team_shmem(),
+              (scheme.degree_coarse + 1) * (scheme.degree_fine + 1));
+
+            SharedViewValues scratch_pad(team_member.team_shmem(),
+                                         scheme.n_dofs_per_cell_fine * 2);
+
+            // read coarse dof values
+            // Kokkos::parallel_for(
+            //   Kokkos::TeamThreadRange(team_member,
+            //                           scheme.n_dofs_per_cell_coarse),
+            //   [&](const int &i) {
+            //     const unsigned int dof_index =
+            //       scheme.dof_indices_coarse(i, coarse_cell_index);
+            //     if (dof_index != numbers::invalid_unsigned_int)
+            //       values_coarse(i) = src[dof_index];
+            //     else
+            //       values_coarse(i) = 0.;
+            //   });
+
+            // team_member.team_barrier();
+
+            // copy prolongation matrix to the scratch memory
+            Kokkos::parallel_for(
+              Kokkos::TeamThreadRange(team_member,
+                                      (scheme.degree_coarse + 1) *
+                                        (scheme.degree_fine + 1)),
+              [&](const int &i) {
+                prolongation_matrix_device(i) = scheme.prolongation_matrix(i);
+              });
+            team_member.team_barrier();
+
+            TransferCellData cell_data{team_member,
+                                       coarse_cell_index,
+                                       scheme,
+                                       prolongation_matrix_device,
+                                       values_coarse,
+                                       values_fine,
+                                       scratch_pad};
+
+            internal::CellProlongator<dim, VectorType> cell_prolongator(
+              &cell_data, src_device, dst_device);
+
+            cell_transfer.run(cell_prolongator);
+
+            // apply weights if element is continuous
+            // if (scheme.weights.size() > 0)
+            //   {
+            //     Kokkos::parallel_for(
+            //       Kokkos::TeamThreadRange(team_member,
+            //                               scheme.n_dofs_per_cell_fine),
+            //       [&](const int &i) {
+            //         values_fine(i) *= scheme.weights(i, coarse_cell_index);
+            //       });
+            //     team_member.team_barrier();
+            //   }
+
+            // distributed fine values
+            // Kokkos::parallel_for(
+            //   Kokkos::TeamThreadRange(team_member,
+            //   scheme.n_dofs_per_cell_fine),
+            //   [&](const int &i) {
+            //     const unsigned int dof_index =
+            //       scheme.dof_indices_fine(i, coarse_cell_index);
+            //     Kokkos::atomic_add(&dst[dof_index], values_fine(i));
+            //   });
+
+            // team_member.team_barrier();
+          });
+
         ++scheme_index;
       }
   }
@@ -1031,12 +1442,52 @@ namespace Portable
     VectorType       &dst,
     const VectorType &src) const
   {
+    // using TeamPolicy =
+    //   Kokkos::TeamPolicy<MemorySpace::Default::kokkos_space::execution_space>;
+
+    // using Functor = internal::CellRestrictionKernel<dim, VectorType>;
+
+    // MemorySpace::Default::kokkos_space::execution_space exec;
+
+    // unsigned int scheme_index = 0;
+    // for (auto &scheme : schemes)
+    //   {
+    //     if (scheme.n_coarse_cells == 0)
+    //       continue;
+
+    //     Functor restrictor;
+
+    //     auto team_policy =
+    //       TeamPolicy(exec, scheme.n_coarse_cells, Kokkos::AUTO);
+
+    //     internal::ApplyCellKernel<dim, VectorType, Functor>
+    //     apply_restriction(
+    //       restrictor, scheme, src, dst);
+
+    //     Kokkos::parallel_for("prolongate_and_add_h_transfer_scheme_" +
+    //                            std::to_string(scheme_index),
+    //                          team_policy,
+    //                          apply_restriction);
+    //     ++scheme_index;
+    //   }
+
+
     using TeamPolicy =
       Kokkos::TeamPolicy<MemorySpace::Default::kokkos_space::execution_space>;
 
-    using Functor = internal::CellRestrictionKernel<dim, VectorType>;
+    using TeamHandle = Kokkos::TeamPolicy<
+      MemorySpace::Default::kokkos_space::execution_space>::member_type;
+
+    using SharedViewValues = Kokkos::View<
+      Number *,
+      MemorySpace::Default::kokkos_space::execution_space::scratch_memory_space,
+      Kokkos::MemoryTraits<Kokkos::Unmanaged>>;
+
 
     MemorySpace::Default::kokkos_space::execution_space exec;
+
+    DeviceVector<Number> dst_device(dst.get_values(), dst.locally_owned_size());
+    DeviceVector<Number> src_device(src.get_values(), src.locally_owned_size());
 
     unsigned int scheme_index = 0;
     for (auto &scheme : schemes)
@@ -1044,18 +1495,66 @@ namespace Portable
         if (scheme.n_coarse_cells == 0)
           continue;
 
-        Functor restrictor;
-
         auto team_policy =
           TeamPolicy(exec, scheme.n_coarse_cells, Kokkos::AUTO);
 
-        internal::ApplyCellKernel<dim, VectorType, Functor> apply_restriction(
-          restrictor, scheme, src, dst);
+        internal::CellTransferFactory cell_transfer(scheme.degree_fine,
+                                                    scheme.degree_coarse);
 
-        Kokkos::parallel_for("prolongate_and_add_h_transfer_scheme_" +
-                               std::to_string(scheme_index),
-                             team_policy,
-                             apply_restriction);
+        const std::size_t team_shmem_size = SharedViewValues::shmem_size(
+          scheme.n_dofs_per_cell_coarse + // coarse dof values
+          scheme.n_dofs_per_cell_fine +   // fine dof values
+          2 * scheme.n_dofs_per_cell_fine // at most two tmp vectors of at
+                                          // most n_dofs_per_cell_fine size
+          + (scheme.degree_coarse + 1) *
+              (scheme.degree_fine + 1) // prolongation matrix
+        );
+
+        team_policy.set_scratch_size(0, Kokkos::PerTeam(team_shmem_size));
+
+        Kokkos::parallel_for(
+          "restrict_and_add_h_transfer_scheme_" + std::to_string(scheme_index),
+          team_policy,
+          KOKKOS_LAMBDA(const TeamHandle &team_member) {
+            const int coarse_cell_index = team_member.league_rank();
+
+            SharedViewValues values_coarse(team_member.team_shmem(),
+                                           scheme.n_dofs_per_cell_coarse);
+
+            SharedViewValues values_fine(team_member.team_shmem(),
+                                         scheme.n_dofs_per_cell_fine);
+
+            SharedViewValues prolongation_matrix_device(
+              team_member.team_shmem(),
+              (scheme.degree_coarse + 1) * (scheme.degree_fine + 1));
+
+            SharedViewValues scratch_pad(team_member.team_shmem(),
+                                         scheme.n_dofs_per_cell_fine * 2);
+
+            // copy prolongation matrix to the scratch memory
+            Kokkos::parallel_for(
+              Kokkos::TeamThreadRange(team_member,
+                                      (scheme.degree_coarse + 1) *
+                                        (scheme.degree_fine + 1)),
+              [&](const int &i) {
+                prolongation_matrix_device(i) = scheme.prolongation_matrix(i);
+              });
+            team_member.team_barrier();
+
+            TransferCellData cell_data{team_member,
+                                       coarse_cell_index,
+                                       scheme,
+                                       prolongation_matrix_device,
+                                       values_coarse,
+                                       values_fine,
+                                       scratch_pad};
+
+            internal::CellRestrictor<dim, VectorType> cell_restrictor(
+              &cell_data, src_device, dst_device);
+
+            cell_transfer.run(cell_restrictor);
+          });
+
         ++scheme_index;
       }
   }
