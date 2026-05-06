@@ -226,16 +226,6 @@ namespace Portable
       TeamHandle team_member;
 
       /**
-       * Coarse cell index.
-       */
-      const int coarse_cell_index;
-
-      /**
-       * Transfer scheme information.
-       */
-      const MGTransferScheme &transfer_data;
-
-      /**
        * Prolongation matrix in the scratch device memory.
        */
       const SharedViewValues &prolongation_matrix_device;
