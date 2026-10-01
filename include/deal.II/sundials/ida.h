@@ -1,14 +1,16 @@
-// -----------------------------------------------------------------------------
+// ------------------------------------------------------------------------
 //
-// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception OR LGPL-2.1-or-later
-// Copyright (C) 2017 - 2026 by the deal.II authors
+// SPDX-License-Identifier: LGPL-2.1-or-later
+// Copyright (C) 2017 - 2024 by the deal.II authors
 //
 // This file is part of the deal.II library.
 //
-// Detailed license information governing the source code and contributions
-// can be found in LICENSE.md and CONTRIBUTING.md at the top level directory.
+// Part of the source code is dual licensed under Apache-2.0 WITH
+// LLVM-exception OR LGPL-2.1-or-later. Detailed license information
+// governing the source code and code contributions can be found in
+// LICENSE.md and CONTRIBUTING.md at the top level directory of deal.II.
 //
-// -----------------------------------------------------------------------------
+// ------------------------------------------------------------------------
 
 
 #ifndef dealii_sundials_ida_h
@@ -46,11 +48,12 @@
 
 #  include <memory>
 
-#endif // DEAL_II_WITH_SUNDIALS
 
 DEAL_II_NAMESPACE_OPEN
 
-#ifdef DEAL_II_WITH_SUNDIALS
+// Shorthand notation for IDA error codes.
+#  define AssertIDA(code) Assert(code >= 0, ExcIDAError(code))
+
 namespace SUNDIALS
 {
   /**
@@ -558,12 +561,14 @@ namespace SUNDIALS
         const double output_period     = 1e-1,
         // Running parameters
         const double       minimum_step_size             = 1e-6,
+        const double       maximum_step_size             = 0,
         const unsigned int maximum_order                 = 5,
         const unsigned int maximum_non_linear_iterations = 10,
         const double       ls_norm_factor                = 0,
         // Error parameters
         const double absolute_tolerance                = 1e-6,
         const double relative_tolerance                = 1e-5,
+        const double nonlin_conv_coef                  = 0.33,
         const bool   ignore_algebraic_terms_for_errors = true,
         // Initial conditions parameters
         const InitialConditionCorrection &ic_type    = use_y_diff,
@@ -573,8 +578,10 @@ namespace SUNDIALS
         , final_time(final_time)
         , initial_step_size(initial_step_size)
         , minimum_step_size(minimum_step_size)
+        , maximum_step_size(maximum_step_size)
         , absolute_tolerance(absolute_tolerance)
         , relative_tolerance(relative_tolerance)
+        , nonlin_conv_coef(nonlin_conv_coef)
         , maximum_order(maximum_order)
         , output_period(output_period)
         , ignore_algebraic_terms_for_errors(ignore_algebraic_terms_for_errors)
@@ -637,6 +644,7 @@ namespace SUNDIALS
         prm.enter_subsection("Running parameters");
         prm.add_parameter("Initial step size", initial_step_size);
         prm.add_parameter("Minimum step size", minimum_step_size);
+        prm.add_parameter("Maximum step size", maximum_step_size);
         prm.add_parameter("Maximum order of BDF", maximum_order);
         prm.add_parameter("Maximum number of nonlinear iterations",
                           maximum_non_linear_iterations);
@@ -645,6 +653,7 @@ namespace SUNDIALS
         prm.enter_subsection("Error control");
         prm.add_parameter("Absolute error tolerance", absolute_tolerance);
         prm.add_parameter("Relative error tolerance", relative_tolerance);
+        prm.add_parameter("Non linear convergence coefficient", nonlin_conv_coef);
         prm.add_parameter(
           "Ignore algebraic terms for error computations",
           ignore_algebraic_terms_for_errors,
@@ -729,6 +738,11 @@ namespace SUNDIALS
        * Minimum step size.
        */
       double minimum_step_size;
+      
+      /**
+       * Maximum step size.
+       */
+      double maximum_step_size;
 
       /**
        * Absolute error tolerance for adaptive time stepping.
@@ -739,6 +753,11 @@ namespace SUNDIALS
        * Relative error tolerance for adaptive time stepping.
        */
       double relative_tolerance;
+      
+      /**
+       * Constant in the convergence test used by IDA.
+       */
+      double nonlin_conv_coef;
 
       /**
        * Maximum order of BDF.
@@ -1052,7 +1071,16 @@ namespace SUNDIALS
      * order to minimize communication between processes.
      */
     std::function<IndexSet()> differential_components;
-
+    
+    // Mia versione modificata
+    /**
+     * Return a vector whose components are the constraints used by IDA to compute. 
+     * The implementation of this function is optional. If the
+     * user does not provide an implementation, the values are assumed to be
+     * all zero, i.e. variables are not constrained.
+     */
+    std::function<VectorType()> get_constraints;
+    
     /**
      * Return a vector whose components are the weights used by IDA to compute
      * the vector norm. The implementation of this function is optional. If the
@@ -1060,6 +1088,16 @@ namespace SUNDIALS
      * all ones.
      */
     std::function<VectorType &()> get_local_tolerances;
+
+    /**
+     * Handle IDA exceptions.
+     */
+    DeclException1(ExcIDAError,
+                   int,
+                   << "One of the SUNDIALS IDA internal functions "
+                   << " returned a negative error code: " << arg1
+                   << ". Please consult SUNDIALS manual.");
+
 
   private:
     /**
@@ -1126,20 +1164,10 @@ namespace SUNDIALS
 #    endif // PETSC_USE_COMPLEX
 #  endif   // DEAL_II_WITH_PETSC
   };
-
-  /**
-   * Handle IDA exceptions.
-   */
-  DeclException1(ExcIDAError,
-                 int,
-                 << "One of SUNDIALS IDA's internal functions "
-                 << "returned an error code: " << arg1
-                 << ". Please consult SUNDIALS manual.");
-
 } // namespace SUNDIALS
 
-#endif // DEAL_II_WITH_SUNDIALS
-
 DEAL_II_NAMESPACE_CLOSE
+
+#endif // DEAL_II_WITH_SUNDIALS
 
 #endif

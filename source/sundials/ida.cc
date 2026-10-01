@@ -1,14 +1,16 @@
-// -----------------------------------------------------------------------------
+// ------------------------------------------------------------------------
 //
-// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception OR LGPL-2.1-or-later
-// Copyright (C) 2017 - 2026 by the deal.II authors
+// SPDX-License-Identifier: LGPL-2.1-or-later
+// Copyright (C) 2017 - 2024 by the deal.II authors
 //
 // This file is part of the deal.II library.
 //
-// Detailed license information governing the source code and contributions
-// can be found in LICENSE.md and CONTRIBUTING.md at the top level directory.
+// Part of the source code is dual licensed under Apache-2.0 WITH
+// LLVM-exception OR LGPL-2.1-or-later. Detailed license information
+// governing the source code and code contributions can be found in
+// LICENSE.md and CONTRIBUTING.md at the top level directory of deal.II.
 //
-// -----------------------------------------------------------------------------
+// ------------------------------------------------------------------------
 
 #include <deal.II/base/config.h>
 
@@ -35,20 +37,16 @@
 #  include <deal.II/sundials/n_vector.h>
 #  include <deal.II/sundials/utilities.h>
 
-#  include <idas/idas.h>
-#  if DEAL_II_SUNDIALS_VERSION_GTE(6, 0, 0)
-#    include <sundials/sundials_context.h>
-#  endif
-
 #  include <iomanip>
 #  include <iostream>
 
+#define ZERO  RCONST(0.0)
+#define ONE   RCONST(1.0)
+#define TWO   RCONST(2.0)
 
-#endif // DEAL_II_WITH_SUNDIALS
+
 
 DEAL_II_NAMESPACE_OPEN
-
-#ifdef DEAL_II_WITH_SUNDIALS
 
 namespace SUNDIALS
 {
@@ -296,7 +294,9 @@ namespace SUNDIALS
         AssertIDA(status);
       }
 
+    status = IDASetNonlinConvCoef(ida_mem, data.nonlin_conv_coef);
     status = IDASetInitStep(ida_mem, current_time_step);
+    status = IDASetMaxStep(ida_mem, data.maximum_step_size);
     AssertIDA(status);
 
     status = IDASetUserData(ida_mem, this);
@@ -321,6 +321,39 @@ namespace SUNDIALS
         status = IDASetId(ida_mem, diff_id);
         AssertIDA(status);
       }
+    
+     // Mia versione
+    if (get_constraints)
+      { const auto constraints_vector = get_constraints();
+        // Vector<double> constraints_vector(constraints_vector_solver.size());
+        
+        // N_Vector constraints=NULL;
+        
+        const auto constraints = internal::make_nvector_view(constraints_vector
+#  if !DEAL_II_SUNDIALS_VERSION_LT(6, 0, 0)
+                                                            ,
+                                                          ida_ctx
+#  endif
+        );
+        N_VPrint(constraints);
+        /*
+        double *nv_data = N_VGetArrayPointer(constraints);
+        Assert(nv_data != nullptr, ExcInternalError());
+        long int local_size = NV_LENGTH_S(constraints);
+        for (long int i=0; i<local_size;i++){
+        	std::cout << "Constraint = " << nv_data[i] << std::endl;
+        }
+
+        /*
+	constraints = N_VClone(yy);	
+	N_VPrint(yy);
+	N_VPrint(constraints);
+	N_VConst(ONE, constraints);
+	N_VPrint(constraints);
+        */
+        status = IDASetConstraints(ida_mem, constraints);
+        AssertIDA(status);
+      }  
 
     status = IDASetSuppressAlg(ida_mem, data.ignore_algebraic_terms_for_errors);
     AssertIDA(status);
@@ -359,10 +392,10 @@ namespace SUNDIALS
         }
       if (LS->ops)
         {
-          std::free(LS->ops);
+          free(LS->ops);
           LS->ops = nullptr;
         }
-      std::free(LS);
+      free(LS);
       LS = nullptr;
       return 0;
     };
@@ -423,10 +456,10 @@ namespace SUNDIALS
         }
       if (A->ops)
         {
-          std::free(A->ops);
+          free(A->ops);
           A->ops = nullptr;
         }
-      std::free(A);
+      free(A);
       A = nullptr;
     };
 
@@ -555,6 +588,6 @@ namespace SUNDIALS
 
 } // namespace SUNDIALS
 
+DEAL_II_NAMESPACE_CLOSE
 
 #endif // DEAL_II_WITH_SUNDIALS
-DEAL_II_NAMESPACE_CLOSE
