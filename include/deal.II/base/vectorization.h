@@ -1015,6 +1015,59 @@ vectorized_transpose_and_store(const bool                            add_into,
 
 namespace internal
 {
+#    ifdef __CUDA_ARCH__
+  /**
+   * Storage of the ARM Neon specializations of VectorizedArray in nvcc's
+   * device compilation pass, which rejects GNU vector types also in host
+   * functions reachable from __host__ __device__ templates. VectorizedArray
+   * is never used in device code, so a plain array with the same size and
+   * alignment as the host-side vector type suffices.
+   */
+  template <typename Number, std::size_t width>
+  struct alignas(16) NeonDeviceStorage
+  {
+    Number v[width];
+
+    NeonDeviceStorage
+    operator+(const NeonDeviceStorage &other) const
+    {
+      NeonDeviceStorage result;
+      for (std::size_t i = 0; i < width; ++i)
+        result.v[i] = v[i] + other.v[i];
+      return result;
+    }
+
+    NeonDeviceStorage
+    operator-(const NeonDeviceStorage &other) const
+    {
+      NeonDeviceStorage result;
+      for (std::size_t i = 0; i < width; ++i)
+        result.v[i] = v[i] - other.v[i];
+      return result;
+    }
+
+    NeonDeviceStorage
+    operator*(const NeonDeviceStorage &other) const
+    {
+      NeonDeviceStorage result;
+      for (std::size_t i = 0; i < width; ++i)
+        result.v[i] = v[i] * other.v[i];
+      return result;
+    }
+
+    NeonDeviceStorage
+    operator/(const NeonDeviceStorage &other) const
+    {
+      NeonDeviceStorage result;
+      for (std::size_t i = 0; i < width; ++i)
+        result.v[i] = v[i] / other.v[i];
+      return result;
+    }
+  };
+
+  using neon_float64x2_t = NeonDeviceStorage<double, 2>;
+  using neon_float32x4_t = NeonDeviceStorage<float, 4>;
+#    else
   /**
    * 128-bit GNU vector types backing the ARM Neon specializations of
    * VectorizedArray, used in place of the <arm_neon.h> types.
@@ -1023,6 +1076,7 @@ namespace internal
     __attribute__((__vector_size__(16), __may_alias__));
   typedef float neon_float32x4_t
     __attribute__((__vector_size__(16), __may_alias__));
+#    endif
 } // namespace internal
 
 /**
