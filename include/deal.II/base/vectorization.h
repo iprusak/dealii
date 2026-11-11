@@ -1076,6 +1076,14 @@ namespace internal
     __attribute__((__vector_size__(16), __may_alias__));
   typedef float neon_float32x4_t
     __attribute__((__vector_size__(16), __may_alias__));
+
+  /**
+   * Integer vector types with the same lane width as the types above, used
+   * as masks for __builtin_shuffle() in vectorized_load_and_transpose() and
+   * vectorized_transpose_and_store().
+   */
+  typedef long long neon_int64x2_t __attribute__((__vector_size__(16)));
+  typedef int       neon_int32x4_t __attribute__((__vector_size__(16)));
 #    endif
 } // namespace internal
 
@@ -1372,6 +1380,155 @@ private:
            const VectorizedArray<Number2, width2> &);
 };
 
+
+/**
+ * Specialization for double and ARM Neon.
+ */
+template <>
+DEAL_II_ALWAYS_INLINE inline void
+vectorized_load_and_transpose(const unsigned int                   n_entries,
+                              const std::array<const double *, 2> &in,
+                              VectorizedArray<double, 2>          *out)
+{
+#    ifdef __CUDA_ARCH__
+  // In nvcc's device compilation pass the storage is a plain array, so use
+  // the generic lane-wise loop. This code is never executed on the device.
+  for (unsigned int i = 0; i < n_entries; ++i)
+    for (unsigned int v = 0; v < 2; ++v)
+      out[i][v] = in[v][i];
+#    else
+  const unsigned int n_chunks = n_entries / 2;
+  for (unsigned int i = 0; i < n_chunks; ++i)
+    {
+      internal::neon_float64x2_t u0, u1;
+      std::memcpy(&u0, in[0] + 2 * i, sizeof(u0));
+      std::memcpy(&u1, in[1] + 2 * i, sizeof(u1));
+      // interleave the low and the high lanes of the two rows (zip1/zip2)
+      out[2 * i + 0].data =
+        __builtin_shuffle(u0, u1, internal::neon_int64x2_t{0, 2});
+      out[2 * i + 1].data =
+        __builtin_shuffle(u0, u1, internal::neon_int64x2_t{1, 3});
+    }
+
+  // remainder loop of work that does not divide by 2
+  for (unsigned int i = 2 * n_chunks; i < n_entries; ++i)
+    for (unsigned int v = 0; v < 2; ++v)
+      out[i][v] = in[v][i];
+#    endif
+}
+
+
+
+/**
+ * Specialization for double and ARM Neon.
+ */
+template <>
+DEAL_II_ALWAYS_INLINE inline void
+vectorized_load_and_transpose(const unsigned int          n_entries,
+                              const double               *in,
+                              const unsigned int         *offsets,
+                              VectorizedArray<double, 2> *out)
+{
+  vectorized_load_and_transpose(n_entries,
+                                {{in + offsets[0], in + offsets[1]}},
+                                out);
+}
+
+
+
+/**
+ * Specialization for double and ARM Neon.
+ */
+template <>
+DEAL_II_ALWAYS_INLINE inline void
+vectorized_transpose_and_store(const bool                        add_into,
+                               const unsigned int                n_entries,
+                               const VectorizedArray<double, 2> *in,
+                               const std::array<double *, 2>    &out)
+{
+#    ifdef __CUDA_ARCH__
+  // See vectorized_load_and_transpose() above.
+  if (add_into)
+    {
+      for (unsigned int i = 0; i < n_entries; ++i)
+        for (unsigned int v = 0; v < 2; ++v)
+          out[v][i] += in[i][v];
+    }
+  else
+    {
+      for (unsigned int i = 0; i < n_entries; ++i)
+        for (unsigned int v = 0; v < 2; ++v)
+          out[v][i] = in[i][v];
+    }
+#    else
+  const unsigned int n_chunks = n_entries / 2;
+  if (add_into)
+    {
+      for (unsigned int i = 0; i < n_chunks; ++i)
+        {
+          const internal::neon_float64x2_t u0 = in[2 * i + 0].data;
+          const internal::neon_float64x2_t u1 = in[2 * i + 1].data;
+          internal::neon_float64x2_t       res0 =
+            __builtin_shuffle(u0, u1, internal::neon_int64x2_t{0, 2});
+          internal::neon_float64x2_t res1 =
+            __builtin_shuffle(u0, u1, internal::neon_int64x2_t{1, 3});
+          internal::neon_float64x2_t o0, o1;
+          std::memcpy(&o0, out[0] + 2 * i, sizeof(o0));
+          std::memcpy(&o1, out[1] + 2 * i, sizeof(o1));
+          res0 = o0 + res0;
+          res1 = o1 + res1;
+          std::memcpy(out[0] + 2 * i, &res0, sizeof(res0));
+          std::memcpy(out[1] + 2 * i, &res1, sizeof(res1));
+        }
+
+      // remainder loop for lengths that do not divide by 2
+      for (unsigned int i = 2 * n_chunks; i < n_entries; ++i)
+        for (unsigned int v = 0; v < 2; ++v)
+          out[v][i] += in[i][v];
+    }
+  else
+    {
+      for (unsigned int i = 0; i < n_chunks; ++i)
+        {
+          const internal::neon_float64x2_t u0 = in[2 * i + 0].data;
+          const internal::neon_float64x2_t u1 = in[2 * i + 1].data;
+          const internal::neon_float64x2_t res0 =
+            __builtin_shuffle(u0, u1, internal::neon_int64x2_t{0, 2});
+          const internal::neon_float64x2_t res1 =
+            __builtin_shuffle(u0, u1, internal::neon_int64x2_t{1, 3});
+          std::memcpy(out[0] + 2 * i, &res0, sizeof(res0));
+          std::memcpy(out[1] + 2 * i, &res1, sizeof(res1));
+        }
+
+      // remainder loop for lengths that do not divide by 2
+      for (unsigned int i = 2 * n_chunks; i < n_entries; ++i)
+        for (unsigned int v = 0; v < 2; ++v)
+          out[v][i] = in[i][v];
+    }
+#    endif
+}
+
+
+
+/**
+ * Specialization for double and ARM Neon.
+ */
+template <>
+DEAL_II_ALWAYS_INLINE inline void
+vectorized_transpose_and_store(const bool                        add_into,
+                               const unsigned int                n_entries,
+                               const VectorizedArray<double, 2> *in,
+                               const unsigned int               *offsets,
+                               double                           *out)
+{
+  vectorized_transpose_and_store(add_into,
+                                 n_entries,
+                                 in,
+                                 {{out + offsets[0], out + offsets[1]}});
+}
+
+
+
 /**
  * Specialization for float and ARM Neon.
  */
@@ -1648,7 +1805,172 @@ private:
 };
 
 
-#  endif
+/**
+ * Specialization for float and ARM Neon.
+ */
+template <>
+DEAL_II_ALWAYS_INLINE inline void
+vectorized_load_and_transpose(const unsigned int                  n_entries,
+                              const std::array<const float *, 4> &in,
+                              VectorizedArray<float, 4>          *out)
+{
+#    ifdef __CUDA_ARCH__
+  // In nvcc's device compilation pass the storage is a plain array, so use
+  // the generic lane-wise loop. This code is never executed on the device.
+  for (unsigned int i = 0; i < n_entries; ++i)
+    for (unsigned int v = 0; v < 4; ++v)
+      out[i][v] = in[v][i];
+#    else
+  const unsigned int n_chunks = n_entries / 4;
+  for (unsigned int i = 0; i < n_chunks; ++i)
+    {
+      internal::neon_float32x4_t u0, u1, u2, u3;
+      std::memcpy(&u0, in[0] + 4 * i, sizeof(u0));
+      std::memcpy(&u1, in[1] + 4 * i, sizeof(u1));
+      std::memcpy(&u2, in[2] + 4 * i, sizeof(u2));
+      std::memcpy(&u3, in[3] + 4 * i, sizeof(u3));
+      // 4x4 transpose in two rounds of interleaving: first 32-bit lanes of
+      // row pairs (zip1/zip2 .4s), then 64-bit halves (zip1/zip2 .2d)
+      const internal::neon_float32x4_t v0 =
+        __builtin_shuffle(u0, u1, internal::neon_int32x4_t{0, 4, 1, 5});
+      const internal::neon_float32x4_t v1 =
+        __builtin_shuffle(u0, u1, internal::neon_int32x4_t{2, 6, 3, 7});
+      const internal::neon_float32x4_t v2 =
+        __builtin_shuffle(u2, u3, internal::neon_int32x4_t{0, 4, 1, 5});
+      const internal::neon_float32x4_t v3 =
+        __builtin_shuffle(u2, u3, internal::neon_int32x4_t{2, 6, 3, 7});
+      out[4 * i + 0].data =
+        __builtin_shuffle(v0, v2, internal::neon_int32x4_t{0, 1, 4, 5});
+      out[4 * i + 1].data =
+        __builtin_shuffle(v0, v2, internal::neon_int32x4_t{2, 3, 6, 7});
+      out[4 * i + 2].data =
+        __builtin_shuffle(v1, v3, internal::neon_int32x4_t{0, 1, 4, 5});
+      out[4 * i + 3].data =
+        __builtin_shuffle(v1, v3, internal::neon_int32x4_t{2, 3, 6, 7});
+    }
+
+  // remainder loop for lengths not divisible by 4
+  for (unsigned int i = 4 * n_chunks; i < n_entries; ++i)
+    for (unsigned int v = 0; v < 4; ++v)
+      out[i][v] = in[v][i];
+#    endif
+}
+
+
+
+/**
+ * Specialization for float and ARM Neon.
+ */
+template <>
+DEAL_II_ALWAYS_INLINE inline void
+vectorized_load_and_transpose(const unsigned int         n_entries,
+                              const float               *in,
+                              const unsigned int        *offsets,
+                              VectorizedArray<float, 4> *out)
+{
+  vectorized_load_and_transpose(
+    n_entries,
+    {{in + offsets[0], in + offsets[1], in + offsets[2], in + offsets[3]}},
+    out);
+}
+
+
+
+/**
+ * Specialization for float and ARM Neon.
+ */
+template <>
+DEAL_II_ALWAYS_INLINE inline void
+vectorized_transpose_and_store(const bool                       add_into,
+                               const unsigned int               n_entries,
+                               const VectorizedArray<float, 4> *in,
+                               const std::array<float *, 4>    &out)
+{
+#    ifdef __CUDA_ARCH__
+  // See vectorized_load_and_transpose() above.
+  if (add_into)
+    {
+      for (unsigned int i = 0; i < n_entries; ++i)
+        for (unsigned int v = 0; v < 4; ++v)
+          out[v][i] += in[i][v];
+    }
+  else
+    {
+      for (unsigned int i = 0; i < n_entries; ++i)
+        for (unsigned int v = 0; v < 4; ++v)
+          out[v][i] = in[i][v];
+    }
+#    else
+  const unsigned int n_chunks = n_entries / 4;
+  for (unsigned int i = 0; i < n_chunks; ++i)
+    {
+      const internal::neon_float32x4_t u0 = in[4 * i + 0].data;
+      const internal::neon_float32x4_t u1 = in[4 * i + 1].data;
+      const internal::neon_float32x4_t u2 = in[4 * i + 2].data;
+      const internal::neon_float32x4_t u3 = in[4 * i + 3].data;
+      const internal::neon_float32x4_t v0 =
+        __builtin_shuffle(u0, u1, internal::neon_int32x4_t{0, 4, 1, 5});
+      const internal::neon_float32x4_t v1 =
+        __builtin_shuffle(u0, u1, internal::neon_int32x4_t{2, 6, 3, 7});
+      const internal::neon_float32x4_t v2 =
+        __builtin_shuffle(u2, u3, internal::neon_int32x4_t{0, 4, 1, 5});
+      const internal::neon_float32x4_t v3 =
+        __builtin_shuffle(u2, u3, internal::neon_int32x4_t{2, 6, 3, 7});
+      internal::neon_float32x4_t res[4] = {
+        __builtin_shuffle(v0, v2, internal::neon_int32x4_t{0, 1, 4, 5}),
+        __builtin_shuffle(v0, v2, internal::neon_int32x4_t{2, 3, 6, 7}),
+        __builtin_shuffle(v1, v3, internal::neon_int32x4_t{0, 1, 4, 5}),
+        __builtin_shuffle(v1, v3, internal::neon_int32x4_t{2, 3, 6, 7})};
+      if (add_into)
+        for (unsigned int v = 0; v < 4; ++v)
+          {
+            internal::neon_float32x4_t o;
+            std::memcpy(&o, out[v] + 4 * i, sizeof(o));
+            res[v] = o + res[v];
+          }
+      for (unsigned int v = 0; v < 4; ++v)
+        std::memcpy(out[v] + 4 * i, &res[v], sizeof(res[v]));
+    }
+
+  // remainder loop for lengths not divisible by 4
+  if (add_into)
+    {
+      for (unsigned int i = 4 * n_chunks; i < n_entries; ++i)
+        for (unsigned int v = 0; v < 4; ++v)
+          out[v][i] += in[i][v];
+    }
+  else
+    {
+      for (unsigned int i = 4 * n_chunks; i < n_entries; ++i)
+        for (unsigned int v = 0; v < 4; ++v)
+          out[v][i] = in[i][v];
+    }
+#    endif
+}
+
+
+
+/**
+ * Specialization for float and ARM Neon.
+ */
+template <>
+DEAL_II_ALWAYS_INLINE inline void
+vectorized_transpose_and_store(const bool                       add_into,
+                               const unsigned int               n_entries,
+                               const VectorizedArray<float, 4> *in,
+                               const unsigned int              *offsets,
+                               float                           *out)
+{
+  vectorized_transpose_and_store(
+    add_into,
+    n_entries,
+    in,
+    {{out + offsets[0], out + offsets[1], out + offsets[2], out + offsets[3]}});
+}
+
+
+
+#  endif // if DEAL_II_VECTORIZATION_WIDTH_IN_BITS >= 128 && defined(__ARM_NEON)
 
 #  if DEAL_II_VECTORIZATION_WIDTH_IN_BITS >= 128 && defined(__SSE2__)
 
