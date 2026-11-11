@@ -27,8 +27,6 @@
 
 #ifdef _MSC_VER
 #  include <intrin.h>
-#elif defined(__ARM_NEON)
-#  include <arm_neon.h>
 #elif defined(__x86_64__)
 #  include <x86intrin.h>
 #endif
@@ -306,8 +304,12 @@ namespace fast_transcendental
     type_cast(const VectorizedArray<double, 2> &in)
     {
       VectorizedArray<double, 2> out;
-      const int64x2_t            int_values = vcvtq_s64_f64(in.data);
-      out.data                              = vreinterpretq_f64_s64(int_values);
+      int64_t                    int_values[2];
+      for (int i = 0; i < 2; i++)
+        {
+          int_values[i] = static_cast<int64_t>(in[i]);
+        }
+      std::memcpy(&out.data, int_values, sizeof(out.data));
       return out;
     }
 
@@ -315,8 +317,12 @@ namespace fast_transcendental
     type_cast(const VectorizedArray<float, 4> &in)
     {
       VectorizedArray<float, 4> out;
-      const int32x4_t           int_values = vcvtq_s32_f32(in.data);
-      out.data                             = vreinterpretq_f32_s32(int_values);
+      int32_t                   int_values[4];
+      for (int i = 0; i < 4; i++)
+        {
+          int_values[i] = static_cast<int32_t>(in[i]);
+        }
+      std::memcpy(&out.data, int_values, sizeof(out.data));
       return out;
     }
 #endif

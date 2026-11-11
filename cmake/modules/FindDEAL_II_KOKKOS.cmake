@@ -122,12 +122,14 @@ if(KOKKOS_FOUND)
   set(KOKKOS_VERSION ${Kokkos_VERSION})
 
   if(Kokkos_ENABLE_CUDA)
-    if (NOT CMAKE_CXX_COMPILER_ID MATCHES Clang)
+    if (NOT CMAKE_CXX_COMPILER_ID MATCHES Clang AND NOT DEAL_II_HAVE_ARM_NEON)
       # We need to disable SIMD vectorization for CUDA device code with nvcc.
       # Otherwise, nvcc compilers from version 9 on will emit an error message like:
       # "[...] contains a vector, which is not supported in device code". We
       # would like to set the variable in check_01_cpu_feature but at that point
-      # we don't know if CUDA support is enabled in Kokkos
+      # we don't know if CUDA support is enabled in Kokkos. The ARM Neon
+      # specializations of VectorizedArray use plain arrays in nvcc's device
+      # compilation pass and are therefore not affected.
       set(DEAL_II_VECTORIZATION_WIDTH_IN_BITS 0)
     endif()
 
