@@ -248,30 +248,25 @@ if(DEAL_II_ALLOW_PLATFORM_INTROSPECTION)
       #ifndef __ARM_NEON
       #error Preprocessor flag not found
       #endif
-      #include <arm_neon.h>
-      #include <stdlib.h>
+      #include <string.h>
+      typedef double vector_t __attribute__((__vector_size__(16), __may_alias__));
       int main()
       {
-      float64x2_t a, b;
-      const unsigned int vector_bytes = sizeof(float64x2_t);
-      const int n_vectors = vector_bytes/sizeof(double);
-      float64x2_t * data =
-        reinterpret_cast<float64x2_t*>(aligned_alloc (vector_bytes, 2*vector_bytes));
-      double * ptr = reinterpret_cast<double*>(&a);
-      ptr[0] = static_cast<volatile double>(1.0);
-      for (int i=1; i<n_vectors; ++i)
-        ptr[i] = 0.0;
-      b = vdupq_n_f64 (static_cast<volatile double>(2.25));
-      data[0] = vaddq_f64 (a, b);
-      data[1] = vmulq_f64 (b, data[0]);
-      ptr = reinterpret_cast<double*>(&data[1]);
+      const double a_values[2] = {static_cast<volatile double>(1.0), 0.0};
+      const double b_values[2] = {static_cast<volatile double>(2.25),
+                                  static_cast<volatile double>(2.25)};
+      vector_t a, b, data[2];
+      memcpy(&a, a_values, sizeof(vector_t));
+      memcpy(&b, b_values, sizeof(vector_t));
+      data[0] = a + b;
+      data[1] = b * data[0];
+      double result[2];
+      memcpy(result, &data[1], sizeof(vector_t));
       int return_value = 0;
-      if (ptr[0] != 7.3125)
+      if (result[0] != 7.3125)
         return_value = 1;
-      for (int i=1; i<n_vectors; ++i)
-        if (ptr[i] != 5.0625)
-          return_value = 1;
-      free(data);
+      if (result[1] != 5.0625)
+        return_value = 1;
       return return_value;
       }
       "

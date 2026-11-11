@@ -23,6 +23,7 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <cstring>
 
 // Note:
 // The flag DEAL_II_VECTORIZATION_WIDTH_IN_BITS is essentially constructed
@@ -69,7 +70,8 @@
 #    undef pixel
 #    undef bool
 #  elif defined(__ARM_NEON)
-#    include <arm_neon.h>
+// The Neon specializations below use GNU vector extensions instead of
+// <arm_neon.h>, which some compilers (e.g., nvcc) cannot parse.
 #  elif defined(__x86_64__)
 #    include <x86intrin.h>
 #  endif
@@ -1011,6 +1013,72 @@ vectorized_transpose_and_store(const bool                            add_into,
 
 #  if DEAL_II_VECTORIZATION_WIDTH_IN_BITS >= 128 && defined(__ARM_NEON)
 
+namespace internal
+{
+#    ifdef __CUDA_ARCH__
+  /**
+   * Storage of the ARM Neon specializations of VectorizedArray in nvcc's
+   * device compilation pass, which rejects GNU vector types also in host
+   * functions reachable from __host__ __device__ templates. VectorizedArray
+   * is never used in device code, so a plain array with the same size and
+   * alignment as the host-side vector type suffices.
+   */
+  template <typename Number, std::size_t width>
+  struct alignas(16) NeonDeviceStorage
+  {
+    Number v[width];
+
+    NeonDeviceStorage
+    operator+(const NeonDeviceStorage &other) const
+    {
+      NeonDeviceStorage result;
+      for (std::size_t i = 0; i < width; ++i)
+        result.v[i] = v[i] + other.v[i];
+      return result;
+    }
+
+    NeonDeviceStorage
+    operator-(const NeonDeviceStorage &other) const
+    {
+      NeonDeviceStorage result;
+      for (std::size_t i = 0; i < width; ++i)
+        result.v[i] = v[i] - other.v[i];
+      return result;
+    }
+
+    NeonDeviceStorage
+    operator*(const NeonDeviceStorage &other) const
+    {
+      NeonDeviceStorage result;
+      for (std::size_t i = 0; i < width; ++i)
+        result.v[i] = v[i] * other.v[i];
+      return result;
+    }
+
+    NeonDeviceStorage
+    operator/(const NeonDeviceStorage &other) const
+    {
+      NeonDeviceStorage result;
+      for (std::size_t i = 0; i < width; ++i)
+        result.v[i] = v[i] / other.v[i];
+      return result;
+    }
+  };
+
+  using neon_float64x2_t = NeonDeviceStorage<double, 2>;
+  using neon_float32x4_t = NeonDeviceStorage<float, 4>;
+#    else
+  /**
+   * 128-bit GNU vector types backing the ARM Neon specializations of
+   * VectorizedArray, used in place of the <arm_neon.h> types.
+   */
+  typedef double neon_float64x2_t
+    __attribute__((__vector_size__(16), __may_alias__));
+  typedef float neon_float32x4_t
+    __attribute__((__vector_size__(16), __may_alias__));
+#    endif
+} // namespace internal
+
 /**
  * Specialization for double and ARM Neon.
  */
@@ -1058,7 +1126,10 @@ public:
   VectorizedArray &
   operator=(const double x) &
   {
-    data = vdupq_n_f64(x);
+    // Brace initialization of the vector type is lowered by GCC to a single
+    // lane-duplicate instruction, whereas filling a temporary array and
+    // copying it goes through the stack or general-purpose registers.
+    data = internal::neon_float64x2_t{x, x};
     return *this;
   }
 
@@ -1094,7 +1165,7 @@ public:
   VectorizedArray &
   operator+=(const VectorizedArray &vec)
   {
-    data = vaddq_f64(data, vec.data);
+    data = data + vec.data;
     return *this;
   }
 
@@ -1104,7 +1175,7 @@ public:
   VectorizedArray &
   operator-=(const VectorizedArray &vec)
   {
-    data = vsubq_f64(data, vec.data);
+    data = data - vec.data;
     return *this;
   }
 
@@ -1114,7 +1185,7 @@ public:
   VectorizedArray &
   operator*=(const VectorizedArray &vec)
   {
-    data = vmulq_f64(data, vec.data);
+    data = data * vec.data;
     return *this;
   }
 
@@ -1124,7 +1195,7 @@ public:
   VectorizedArray &
   operator/=(const VectorizedArray &vec)
   {
-    data = vdivq_f64(data, vec.data);
+    data = data / vec.data;
     return *this;
   }
 
@@ -1136,7 +1207,7 @@ public:
   void
   load(const double *ptr)
   {
-    data = vld1q_f64(ptr);
+    std::memcpy(&data, ptr, sizeof(data));
   }
 
   DEAL_II_ALWAYS_INLINE inline void
@@ -1144,7 +1215,7 @@ public:
   {
     DEAL_II_OPENMP_SIMD_PRAGMA
     for (unsigned int i = 0; i < 2; ++i)
-      data[i] = ptr[i];
+      (*this)[i] = ptr[i];
   }
 
   /**
@@ -1156,7 +1227,7 @@ public:
   void
   store(double *ptr) const
   {
-    vst1q_f64(ptr, data);
+    std::memcpy(ptr, &data, sizeof(data));
   }
 
   DEAL_II_ALWAYS_INLINE inline void
@@ -1164,7 +1235,7 @@ public:
   {
     DEAL_II_OPENMP_SIMD_PRAGMA
     for (unsigned int i = 0; i < 2; ++i)
-      ptr[i] = data[i];
+      ptr[i] = (*this)[i];
   }
 
   /**
@@ -1176,7 +1247,7 @@ public:
   {
     Assert(reinterpret_cast<std::size_t>(ptr) % 16 == 0,
            ExcMessage("Memory not aligned"));
-    vst1q_f64(ptr, data);
+    std::memcpy(ptr, &data, sizeof(data));
   }
 
   /**
@@ -1209,7 +1280,7 @@ public:
   double
   sum() const
   {
-    return vaddvq_f64(data);
+    return (*this)[0] + (*this)[1];
   }
 
   /**
@@ -1219,7 +1290,8 @@ public:
   get_floor() const
   {
     VectorizedArray res;
-    res.data = vrndmq_f64(data);
+    for (unsigned int i = 0; i < 2; ++i)
+      res[i] = std::floor((*this)[i]);
     return res;
   }
 
@@ -1228,7 +1300,7 @@ public:
    * enable interaction with external SIMD functionality, this member is
    * declared public.
    */
-  mutable float64x2_t data;
+  mutable internal::neon_float64x2_t data;
 
 private:
   /**
@@ -1239,7 +1311,8 @@ private:
   get_sqrt() const
   {
     VectorizedArray res;
-    res.data = vsqrtq_f64(data);
+    for (unsigned int i = 0; i < 2; ++i)
+      res[i] = std::sqrt((*this)[i]);
     return res;
   }
 
@@ -1251,7 +1324,8 @@ private:
   get_abs() const
   {
     VectorizedArray res;
-    res.data = vabsq_f64(data);
+    for (unsigned int i = 0; i < 2; ++i)
+      res[i] = std::abs((*this)[i]);
     return res;
   }
 
@@ -1263,7 +1337,8 @@ private:
   get_max(const VectorizedArray &other) const
   {
     VectorizedArray res;
-    res.data = vmaxq_f64(data, other.data);
+    for (unsigned int i = 0; i < 2; ++i)
+      res[i] = std::max((*this)[i], other[i]);
     return res;
   }
 
@@ -1275,7 +1350,8 @@ private:
   get_min(const VectorizedArray &other) const
   {
     VectorizedArray res;
-    res.data = vminq_f64(data, other.data);
+    for (unsigned int i = 0; i < 2; ++i)
+      res[i] = std::min((*this)[i], other[i]);
     return res;
   }
 
@@ -1343,7 +1419,7 @@ public:
   VectorizedArray &
   operator=(const float x) &
   {
-    data = vdupq_n_f32(x);
+    data = internal::neon_float32x4_t{x, x, x, x};
     return *this;
   }
 
@@ -1379,7 +1455,7 @@ public:
   VectorizedArray &
   operator+=(const VectorizedArray &vec)
   {
-    data = vaddq_f32(data, vec.data);
+    data = data + vec.data;
     return *this;
   }
 
@@ -1389,7 +1465,7 @@ public:
   VectorizedArray &
   operator-=(const VectorizedArray &vec)
   {
-    data = vsubq_f32(data, vec.data);
+    data = data - vec.data;
     return *this;
   }
 
@@ -1399,7 +1475,7 @@ public:
   VectorizedArray &
   operator*=(const VectorizedArray &vec)
   {
-    data = vmulq_f32(data, vec.data);
+    data = data * vec.data;
     return *this;
   }
 
@@ -1409,7 +1485,7 @@ public:
   VectorizedArray &
   operator/=(const VectorizedArray &vec)
   {
-    data = vdivq_f32(data, vec.data);
+    data = data / vec.data;
     return *this;
   }
 
@@ -1421,7 +1497,7 @@ public:
   void
   load(const float *ptr)
   {
-    data = vld1q_f32(ptr);
+    std::memcpy(&data, ptr, sizeof(data));
   }
 
   /**
@@ -1433,7 +1509,7 @@ public:
   void
   store(float *ptr) const
   {
-    vst1q_f32(ptr, data);
+    std::memcpy(ptr, &data, sizeof(data));
   }
 
   /**
@@ -1445,7 +1521,7 @@ public:
   {
     Assert(reinterpret_cast<std::size_t>(ptr) % 16 == 0,
            ExcMessage("Memory not aligned"));
-    vst1q_f32(ptr, data);
+    std::memcpy(ptr, &data, sizeof(data));
   }
 
   /**
@@ -1478,7 +1554,7 @@ public:
   float
   sum() const
   {
-    return vaddvq_f32(data);
+    return ((*this)[0] + (*this)[1]) + ((*this)[2] + (*this)[3]);
   }
 
 
@@ -1489,7 +1565,8 @@ public:
   get_floor() const
   {
     VectorizedArray res;
-    res.data = vrndmq_f32(data);
+    for (unsigned int i = 0; i < 4; ++i)
+      res[i] = std::floor((*this)[i]);
     return res;
   }
 
@@ -1498,7 +1575,7 @@ public:
    * enable interaction with external SIMD functionality, this member is
    * declared public.
    */
-  mutable float32x4_t data;
+  mutable internal::neon_float32x4_t data;
 
 private:
   /**
@@ -1509,7 +1586,8 @@ private:
   get_sqrt() const
   {
     VectorizedArray res;
-    res.data = vsqrtq_f32(data);
+    for (unsigned int i = 0; i < 4; ++i)
+      res[i] = std::sqrt((*this)[i]);
     return res;
   }
 
@@ -1521,7 +1599,8 @@ private:
   get_abs() const
   {
     VectorizedArray res;
-    res.data = vabsq_f32(data);
+    for (unsigned int i = 0; i < 4; ++i)
+      res[i] = std::abs((*this)[i]);
     return res;
   }
 
@@ -1533,7 +1612,8 @@ private:
   get_max(const VectorizedArray &other) const
   {
     VectorizedArray res;
-    res.data = vmaxq_f32(data, other.data);
+    for (unsigned int i = 0; i < 4; ++i)
+      res[i] = std::max((*this)[i], other[i]);
     return res;
   }
 
@@ -1545,7 +1625,8 @@ private:
   get_min(const VectorizedArray &other) const
   {
     VectorizedArray res;
-    res.data = vminq_f32(data, other.data);
+    for (unsigned int i = 0; i < 4; ++i)
+      res[i] = std::min((*this)[i], other[i]);
     return res;
   }
 
@@ -5958,34 +6039,12 @@ compare_and_apply_mask(const VectorizedArray<float, 4> &left,
                        const VectorizedArray<float, 4> &true_values,
                        const VectorizedArray<float, 4> &false_values)
 {
-  uint32x4_t mask;
-  switch (predicate)
-    {
-      case SIMDComparison::equal:
-        mask = vceqq_f32(left.data, right.data);
-        break;
-      case SIMDComparison::not_equal:
-        mask = vmvnq_u32(vceqq_f32(left.data, right.data));
-        break;
-      case SIMDComparison::less_than:
-        mask = vcltq_f32(left.data, right.data);
-        break;
-      case SIMDComparison::less_than_or_equal:
-        mask = vcleq_f32(left.data, right.data);
-        break;
-      case SIMDComparison::greater_than:
-        mask = vcgtq_f32(left.data, right.data);
-        break;
-      case SIMDComparison::greater_than_or_equal:
-        mask = vcgeq_f32(left.data, right.data);
-        break;
-    }
-
   VectorizedArray<float, 4> result;
-  result.data = vreinterpretq_f32_u32(vorrq_u32(
-    vandq_u32(mask, vreinterpretq_u32_f32(true_values.data)),
-    vandq_u32(vmvnq_u32(mask), vreinterpretq_u32_f32(false_values.data))));
-
+  for (unsigned int i = 0; i < 4; ++i)
+    result[i] = compare_and_apply_mask<predicate>(left[i],
+                                                  right[i],
+                                                  true_values[i],
+                                                  false_values[i]);
   return result;
 }
 
@@ -5997,36 +6056,12 @@ compare_and_apply_mask(const VectorizedArray<double, 2> &left,
                        const VectorizedArray<double, 2> &true_values,
                        const VectorizedArray<double, 2> &false_values)
 {
-  uint64x2_t mask;
-  switch (predicate)
-    {
-      case SIMDComparison::equal:
-        mask = vceqq_f64(left.data, right.data);
-        break;
-      case SIMDComparison::not_equal:
-        mask = vreinterpretq_u64_u32(
-          vmvnq_u32(vreinterpretq_u32_u64(vceqq_f64(left.data, right.data))));
-        break;
-      case SIMDComparison::less_than:
-        mask = vcltq_f64(left.data, right.data);
-        break;
-      case SIMDComparison::less_than_or_equal:
-        mask = vcleq_f64(left.data, right.data);
-        break;
-      case SIMDComparison::greater_than:
-        mask = vcgtq_f64(left.data, right.data);
-        break;
-      case SIMDComparison::greater_than_or_equal:
-        mask = vcgeq_f64(left.data, right.data);
-        break;
-    }
-
   VectorizedArray<double, 2> result;
-  result.data = vreinterpretq_f64_u64(vorrq_u64(
-    vandq_u64(mask, vreinterpretq_u64_f64(true_values.data)),
-    vandq_u64(vreinterpretq_u64_u32(vmvnq_u32(vreinterpretq_u32_u64(mask))),
-              vreinterpretq_u64_f64(false_values.data))));
-
+  for (unsigned int i = 0; i < 2; ++i)
+    result[i] = compare_and_apply_mask<predicate>(left[i],
+                                                  right[i],
+                                                  true_values[i],
+                                                  false_values[i]);
   return result;
 }
 
