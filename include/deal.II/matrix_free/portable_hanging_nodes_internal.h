@@ -354,15 +354,6 @@ namespace Portable
     namespace batched
     {
       /**
-       * View of the ConstraintKinds of the cells of a batch, one entry per
-       * cell starting with the first cell of the batch. The caller provides
-       * it, e.g., as a subview of the masks of all cells.
-       */
-      using ConstraintMaskView = Kokkos::View<
-        const dealii::internal::MatrixFreeFunctions::ConstraintKinds *,
-        MemorySpace::Default::kokkos_space>;
-
-      /**
        * View of the `(fe_degree + 1)^2` 1d interpolation weights in team
        * scratch memory.
        */
@@ -379,10 +370,10 @@ namespace Portable
        * Batched variant of Portable::internal::interpolate_boundary(): apply
        * the hanging-node interpolation along one @p direction to the cells
        * of a batch, whose values are stored cell after cell in @p values
-       * with `(fe_degree + 1)^dim` entries each. @p constraint_masks holds
-       * the ConstraintKinds of the cells of the batch, of which there are
-       * @p batch_size, and @p constraint_weights the 1d interpolation
-       * weights in team scratch memory.
+       * with `(fe_degree + 1)^dim` entries each. @p constraint_masks is a
+       * one-dimensional view of the ConstraintKinds of the cells of the
+       * batch, of which there are @p batch_size, and @p constraint_weights
+       * holds the 1d interpolation weights in team scratch memory.
        *
        * As in the cell-wise function, each thread handles one constrained
        * line of one cell, now with the lines of all cells of the batch in a
@@ -393,6 +384,7 @@ namespace Portable
                 int  direction,
                 bool transpose,
                 typename Number,
+                typename MaskViewType,
                 typename ViewType>
       DEAL_II_HOST_DEVICE inline void
       interpolate_boundary(
@@ -400,7 +392,7 @@ namespace Portable
           MemorySpace::Default::kokkos_space::execution_space>::member_type
                                            &team_member,
         const ConstraintWeightsView<Number> constraint_weights,
-        const ConstraintMaskView            constraint_masks,
+        const MaskViewType                  constraint_masks,
         ViewType                            values,
         const int                           batch_size = 1)
       {
@@ -584,6 +576,7 @@ namespace Portable
                 int  fe_degree,
                 bool transpose,
                 typename Number,
+                typename MaskViewType,
                 typename ViewType>
       DEAL_II_HOST_DEVICE void
       resolve_hanging_nodes(
@@ -591,7 +584,7 @@ namespace Portable
           MemorySpace::Default::kokkos_space::execution_space>::member_type
                                            &team_member,
         const ConstraintWeightsView<Number> constraint_weights,
-        const ConstraintMaskView            constraint_masks,
+        const MaskViewType                  constraint_masks,
         ViewType                            values,
         const int                           batch_size = 1)
       {

@@ -837,7 +837,7 @@ namespace Portable
         /**
          * Number of quadrature points per cell.
          */
-        const unsigned int n_q_points;
+        const unsigned int n_q_points_per_cell;
 
         /**
          * Number of DoFHandler objects, i.e., of used entries in
@@ -847,8 +847,9 @@ namespace Portable
 
         /**
          * Half-open range [first, second) of the cells handled by this team,
-         * in the same index space as Portable::MatrixFree::Data::cell_index.
-         * The last batch of a cell loop may be shorter than the others.
+         * numbered within the cells of the current color, i.e., as the
+         * arrays of @p precomputed_data are indexed. The last batch of a
+         * cell loop may be shorter than the others.
          */
         const Kokkos::pair<int, int> cell_range;
 
@@ -874,6 +875,29 @@ namespace Portable
         {
           Assert(cell_range.first <= cell_range.second, ExcInternalError());
           return cell_range.second - cell_range.first;
+        }
+
+        /**
+         * Apply the given functor to each quadrature point of each cell in
+         * @p cell_range in parallel. The functor receives the index of the
+         * point within the batch, `b * n_q_points_per_cell + q` for point `q`
+         * of the `b`-th cell of the range, which is the index the point is
+         * stored at in @p shared_data.
+         *
+         * @p func needs to define
+         * \code
+         * DEAL_II_HOST_DEVICE void operator()(const int &q_point) const;
+         * \endcode
+         */
+        template <typename Functor>
+        DEAL_II_HOST_DEVICE void
+        for_each_quad_point(const Functor &func) const
+        {
+          Kokkos::parallel_for(Kokkos::TeamVectorRange(team_member,
+                                                       batch_size() *
+                                                         n_q_points_per_cell),
+                               [&](const int &q) { func(q); });
+          team_member.team_barrier();
         }
       };
 
@@ -1385,7 +1409,7 @@ namespace Portable
                   populate_view<false>(data->team_member,
                                        u,
                                        temp,
-                                       batch_size * data->n_q_points);
+                                       batch_size * data->n_q_points_per_cell);
                 }
               else if constexpr (dim == 2)
                 {
@@ -1407,7 +1431,7 @@ namespace Portable
                   populate_view<false>(data->team_member,
                                        u,
                                        temp,
-                                       batch_size * data->n_q_points);
+                                       batch_size * data->n_q_points_per_cell);
                 }
 
               // apply derivatives in collocation space fused along all dim
