@@ -14,7 +14,8 @@
 #define dealii_tests_batched_fe_evaluation_common_h
 
 // Common harness for the tests of
-// Portable::internal::batched::FEEvaluation.
+// Portable::internal::batched::FEEvaluation and
+// Portable::internal::batched::cell_loop().
 //
 // The cells of each color of a Portable::MatrixFree object are processed in
 // batches of batch_size cells (the last batch of a color may be shorter) by
@@ -133,6 +134,48 @@ coefficient_value(const Point<dim> &p)
 
 
 
+// The operator on the cells of one batch, with the signature expected by
+// Portable::internal::batched::cell_loop().
+template <int dim, int fe_degree, int n_q_points_1d, typename Operator>
+struct BatchedLocalOperator
+{
+  using Number      = double;
+  using BatchedData = Portable::internal::batched::BatchedData<dim, Number>;
+
+  static constexpr unsigned int n_q_points = Utilities::pow(n_q_points_1d, dim);
+
+  DEAL_II_HOST_DEVICE void
+  operator()(const BatchedData                    *data,
+             const Portable::DeviceVector<Number> &src,
+             Portable::DeviceVector<Number>       &dst) const
+  {
+    Portable::internal::batched::FEEvaluation<dim,
+                                              fe_degree,
+                                              n_q_points_1d,
+                                              Operator::n_components,
+                                              Number>
+      fe_eval(data);
+
+    fe_eval.read_dof_values(src);
+    fe_eval.evaluate(EvaluationFlags::values | EvaluationFlags::gradients);
+
+    data->for_each_quad_point([&](const int &q_point) {
+      // position of the point in a field with n_q_points entries per cell
+      const int position =
+        fe_eval.get_current_cell_index(q_point) * n_q_points +
+        q_point % n_q_points;
+      Operator::apply(fe_eval, q_point, coefficient(position));
+    });
+
+    fe_eval.integrate(EvaluationFlags::values | EvaluationFlags::gradients);
+    fe_eval.distribute_local_to_global(dst);
+  }
+
+  Portable::DeviceVector<Number> coefficient;
+};
+
+
+
 template <int dim, int fe_degree, int n_q_points_1d, typename Operator>
 struct BatchedCellOperator
 {
@@ -177,29 +220,9 @@ struct BatchedCellOperator
                                precomputed_data,
                                shared_data};
 
-        Portable::internal::batched::FEEvaluation<dim,
-                                                  fe_degree,
-                                                  n_q_points_1d,
-                                                  Operator::n_components,
-                                                  Number>
-          fe_eval(&data);
-
-        fe_eval.read_dof_values(src);
-        fe_eval.evaluate(EvaluationFlags::values | EvaluationFlags::gradients);
-
-        data.for_each_quad_point([&](const int &q_point) {
-          // position of the point in a field with n_q_points_per_cell entries
-          // per cell
-          const int position =
-            fe_eval.get_current_cell_index(q_point) * n_q_points_per_cell +
-            q_point % n_q_points_per_cell;
-          Operator::apply(fe_eval, q_point, coefficient(position));
-        });
-
-        fe_eval.integrate(EvaluationFlags::values | EvaluationFlags::gradients);
-
         Portable::DeviceVector<Number> dst_nonconst = dst;
-        fe_eval.distribute_local_to_global(dst_nonconst);
+        BatchedLocalOperator<dim, fe_degree, n_q_points_1d, Operator>{
+          coefficient}(&data, src, dst_nonconst);
       }
   }
 
@@ -217,7 +240,8 @@ void
 test(const bool lobatto,
      const Mesh mesh,
      const bool use_coloring,
-     const int  batch_size)
+     const int  batch_size,
+     const bool use_cell_loop = false)
 {
   using Number  = double;
   using Functor = BatchedCellOperator<dim, fe_degree, n_q_points_1d, Operator>;
@@ -348,35 +372,50 @@ test(const bool lobatto,
   }
   dst = 0.;
 
-  // Batched cell loop
-  MemorySpace::Default::kokkos_space::execution_space exec;
-  for (unsigned int color = 0; color < n_colors; ++color)
+  // Batched cell loop, with the launch of the library (batch_size < 0:
+  // automatic batch size) or with at most two teams per color
+  if (use_cell_loop)
+    Portable::internal::batched::cell_loop(
+      matrix_free,
+      BatchedLocalOperator<dim, fe_degree, n_q_points_1d, Operator>{
+        Portable::DeviceVector<Number>(coefficient.get_values(),
+                                       coefficient.size())},
+      src,
+      dst,
+      batch_size < 0 ? numbers::invalid_unsigned_int : batch_size);
+  else
     {
-      const auto gpu_data = matrix_free.get_data(color);
-      if (gpu_data.n_cells == 0)
-        continue;
+      MemorySpace::Default::kokkos_space::execution_space exec;
+      for (unsigned int color = 0; color < n_colors; ++color)
+        {
+          const auto gpu_data = matrix_free.get_data(color);
+          if (gpu_data.n_cells == 0)
+            continue;
 
-      // Fewer teams than batches, so that a team handles several batches
-      const int n_batches = (gpu_data.n_cells + batch_size - 1) / batch_size;
-      const int n_teams   = std::min(n_batches, 2);
+          // Fewer teams than batches, so that a team handles several batches
+          const int n_batches =
+            (gpu_data.n_cells + batch_size - 1) / batch_size;
+          const int n_teams = std::min(n_batches, 2);
 
-      Kokkos::TeamPolicy<MemorySpace::Default::kokkos_space::execution_space>
-        team_policy(exec, n_teams, Kokkos::AUTO);
-      team_policy.set_scratch_size(
-        0,
-        Kokkos::PerTeam(Functor::SharedData::shmem_size(n_q_points_per_cell,
-                                                        batch_size,
-                                                        gpu_data)));
+          Kokkos::TeamPolicy<
+            MemorySpace::Default::kokkos_space::execution_space>
+            team_policy(exec, n_teams, Kokkos::AUTO);
+          team_policy.set_scratch_size(
+            0,
+            Kokkos::PerTeam(Functor::SharedData::shmem_size(n_q_points_per_cell,
+                                                            batch_size,
+                                                            gpu_data)));
 
-      Kokkos::parallel_for(
-        team_policy,
-        Functor{gpu_data,
-                batch_size,
-                Portable::DeviceVector<Number>(coefficient.get_values(),
-                                               coefficient.size()),
-                Portable::DeviceVector<Number>(src.get_values(), n_dofs),
-                Portable::DeviceVector<Number>(dst.get_values(), n_dofs)});
-      Kokkos::fence();
+          Kokkos::parallel_for(
+            team_policy,
+            Functor{gpu_data,
+                    batch_size,
+                    Portable::DeviceVector<Number>(coefficient.get_values(),
+                                                   coefficient.size()),
+                    Portable::DeviceVector<Number>(src.get_values(), n_dofs),
+                    Portable::DeviceVector<Number>(dst.get_values(), n_dofs)});
+          Kokkos::fence();
+        }
     }
 
   LinearAlgebra::ReadWriteVector<Number> dst_host(n_dofs);
@@ -396,8 +435,12 @@ test(const bool lobatto,
           << (mesh == Mesh::deformed ?
                 " deformed" :
                 (mesh == Mesh::sheared ? " sheared" : " hanging_nodes"))
-          << " colors=" << n_colors << " batch_size=" << batch_size
-          << " cells: " << n_cells_of_type[0] << " cartesian, "
+          << " colors=" << n_colors << " batch_size=";
+  if (batch_size < 0)
+    deallog << "auto";
+  else
+    deallog << batch_size;
+  deallog << " cells: " << n_cells_of_type[0] << " cartesian, "
           << n_cells_of_type[1] << " affine, " << n_cells_of_type[2]
           << " general, " << n_cells_with_hanging_nodes
           << " with hanging nodes, error " << (relative < 1e-12 ? 0. : relative)
