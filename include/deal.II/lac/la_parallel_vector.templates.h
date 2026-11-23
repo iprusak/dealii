@@ -1100,12 +1100,41 @@ namespace LinearAlgebra
       else
 #  endif
         {
+          Number *ghost_values =
+            data.values.data() + partitioner->locally_owned_size();
+
+#  if defined(DEAL_II_MPI_WITH_DEVICE_SUPPORT)
+          // Send the ghost entries from the end of import_data and not from
+          // the storage of the vector. An MPI transport that lets the
+          // receiving process map the send buffer (direct communication
+          // between GPUs) maps the whole allocation the buffer is part of,
+          // and that mapping can keep the allocation in use after the vector
+          // has been destroyed.
+          if (std::is_same_v<MemorySpaceType, dealii::MemorySpace::Default> &&
+              partitioner->n_ghost_indices() > 0)
+            {
+              const std::size_t n_import = partitioner->n_import_indices();
+              const std::size_t n_ghost  = partitioner->n_ghost_indices();
+              const std::size_t n_owned  = partitioner->locally_owned_size();
+
+              if (import_data.values.size() < n_import + n_ghost)
+                Kokkos::resize(import_data.values, n_import + n_ghost);
+
+              Kokkos::deep_copy(
+                Kokkos::subview(import_data.values,
+                                std::make_pair(n_import, n_import + n_ghost)),
+                Kokkos::subview(data.values,
+                                std::make_pair(n_owned, n_owned + n_ghost)));
+
+              ghost_values = import_data.values.data() + n_import;
+            }
+#  endif
+
           partitioner->import_from_ghosted_array_start(
             operation,
             communication_channel,
-            ArrayView<Number, MemorySpaceType>(
-              data.values.data() + partitioner->locally_owned_size(),
-              partitioner->n_ghost_indices()),
+            ArrayView<Number, MemorySpaceType>(ghost_values,
+                                               partitioner->n_ghost_indices()),
             ArrayView<Number, MemorySpaceType>(import_data.values.data(),
                                                partitioner->n_import_indices()),
             compress_requests);
