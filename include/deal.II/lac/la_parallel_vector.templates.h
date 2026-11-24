@@ -1292,15 +1292,35 @@ namespace LinearAlgebra
       else
 #  endif
         {
+          Number *ghost_values =
+            data.values.data() + partitioner->locally_owned_size();
+
+#  if defined(DEAL_II_MPI_WITH_DEVICE_SUPPORT)
+          // Receive the ghost entries at the end of import_data and not in
+          // the storage of the vector, see compress_start(): an MPI
+          // implementation may also keep the allocation of a receive buffer
+          // on the device mapped in the sending process.
+          if (std::is_same_v<MemorySpaceType, dealii::MemorySpace::Default> &&
+              partitioner->n_ghost_indices() > 0)
+            {
+              const std::size_t n_import = partitioner->n_import_indices();
+              const std::size_t n_ghost  = partitioner->n_ghost_indices();
+
+              if (import_data.values.size() < n_import + n_ghost)
+                Kokkos::resize(import_data.values, n_import + n_ghost);
+
+              ghost_values = import_data.values.data() + n_import;
+            }
+#  endif
+
           partitioner->export_to_ghosted_array_start<Number, MemorySpaceType>(
             communication_channel,
             ArrayView<const Number, MemorySpaceType>(
               data.values.data(), partitioner->locally_owned_size()),
             ArrayView<Number, MemorySpaceType>(import_data.values.data(),
                                                partitioner->n_import_indices()),
-            ArrayView<Number, MemorySpaceType>(
-              data.values.data() + partitioner->locally_owned_size(),
-              partitioner->n_ghost_indices()),
+            ArrayView<Number, MemorySpaceType>(ghost_values,
+                                               partitioner->n_ghost_indices()),
             update_ghost_values_requests);
         }
 
@@ -1348,11 +1368,39 @@ namespace LinearAlgebra
           else
 #  endif
             {
+              Number *ghost_values =
+                data.values.data() + partitioner->locally_owned_size();
+
+#  if defined(DEAL_II_MPI_WITH_DEVICE_SUPPORT)
+              const bool received_in_import_data =
+                std::is_same_v<MemorySpaceType,
+                               dealii::MemorySpace::Default> &&
+                partitioner->n_ghost_indices() > 0;
+              if (received_in_import_data)
+                ghost_values =
+                  import_data.values.data() + partitioner->n_import_indices();
+#  endif
+
               partitioner->export_to_ghosted_array_finish(
                 ArrayView<Number, MemorySpaceType>(
-                  data.values.data() + partitioner->locally_owned_size(),
-                  partitioner->n_ghost_indices()),
+                  ghost_values, partitioner->n_ghost_indices()),
                 update_ghost_values_requests);
+
+#  if defined(DEAL_II_MPI_WITH_DEVICE_SUPPORT)
+              if (received_in_import_data)
+                {
+                  const std::size_t n_import = partitioner->n_import_indices();
+                  const std::size_t n_ghost  = partitioner->n_ghost_indices();
+                  const std::size_t n_owned  = partitioner->locally_owned_size();
+
+                  Kokkos::deep_copy(
+                    Kokkos::subview(data.values,
+                                    std::make_pair(n_owned, n_owned + n_ghost)),
+                    Kokkos::subview(import_data.values,
+                                    std::make_pair(n_import,
+                                                   n_import + n_ghost)));
+                }
+#  endif
             }
         }
 
